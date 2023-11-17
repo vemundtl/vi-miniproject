@@ -3,6 +3,9 @@ __pycache__
 data
 wandb
 old
+old2
 cityscapesscripts
 saved_images
 u-resnet34.pt
+output2d
+output3d
