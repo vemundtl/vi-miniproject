@@ -1,43 +1,49 @@
-from tqdm import tqdm
+import os
 import numpy as np
+from tqdm import tqdm
+
+import medmnist
+from medmnist import INFO
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.utils.data as data
 import torchvision.transforms as transforms
 
-import medmnist
-from medmnist import INFO, Evaluator
-from medmnist import BloodMNIST
-
-import os
 from collections import OrderedDict
 from copy import deepcopy
 from torch.utils.tensorboard import SummaryWriter
 from utils import Transform3D, model_to_syncbn
+from acsconv.converters import ACSConverter, Conv2_5dConverter, Conv3dConverter
 
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 def extract_data(data_flag, download, BATCH_SIZE):
 
     info = INFO[data_flag]
     task = info['task']
-    n_channels = info['n_channels']
-    n_classes = len(info['label'])
 
     DataClass = getattr(medmnist, info['python_class'])
 
     # preprocessing
+    # data_transform = transforms.Compose([
+    #     transforms.ToTensor(),
+    #     transforms.Normalize(mean=[.5], std=[.5])
+    # ])
+
     data_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        # transforms.RandomResizedCrop(size=(224, 224), scale=(0.8, 1.2)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[.5], std=[.5])
-    ])
+        transforms.Normalize(mean=[0.5], std=[0.5]),
+])
 
     # load the data
-    train_dataset = DataClass(split='train', transform=data_transform, download=download)
-    val_dataset = DataClass(split='val', transform=data_transform, download=download)
-    test_dataset = DataClass(split='test', transform=data_transform, download=download)
-
-    pil_dataset = DataClass(split='train', download=download)
+    train_dataset = DataClass(split='train', transform=data_transform, download=download, as_rgb=True)
+    val_dataset = DataClass(split='val', transform=data_transform, download=download, as_rgb=True)
+    test_dataset = DataClass(split='test', transform=data_transform, download=download, as_rgb=True)
 
     # encapsulate data into dataloader form
     train_loader = data.DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -49,17 +55,8 @@ def extract_data(data_flag, download, BATCH_SIZE):
 
 def extract_data_3d(data_flag, download, BATCH_SIZE):
     info = INFO[data_flag]
-    task = info['task']
-    n_channels = info['n_channels']
-    n_classes = len(info['label'])
 
     DataClass = getattr(medmnist, info['python_class'])
-
-    # preprocessing
-    data_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[.5], std=[.5])
-    ])
 
     train_transform = Transform3D(mul='random') if True else Transform3D()
     eval_transform = Transform3D(mul='0.5') if True else Transform3D()
@@ -78,7 +75,6 @@ def extract_data_3d(data_flag, download, BATCH_SIZE):
     print('==> Building and training model...')
     return train_loader, train_loader_at_eval, val_loader, test_loader
 
-
 def train(model, train_loader, task, criterion, optimizer, device, writer):
     total_loss = []
     global iteration
@@ -86,6 +82,7 @@ def train(model, train_loader, task, criterion, optimizer, device, writer):
 
     model.train()
     for inputs, targets in tqdm(train_loader, desc="train"):
+    # for inputs, targets in train_loader:
         optimizer.zero_grad()
         outputs = model(inputs.to(device))
 
@@ -98,7 +95,6 @@ def train(model, train_loader, task, criterion, optimizer, device, writer):
 
         loss.backward()
         optimizer.step()
-    print("Done with batches")
     
     epoch_loss = sum(total_loss)/len(total_loss)
     print("Epoch loss", epoch_loss)
@@ -113,7 +109,8 @@ def test(model, evaluator, data_loader, task, criterion, device, run, save_folde
     y_score = torch.tensor([]).to(device)
 
     with torch.no_grad():
-        for inputs, targets in tqdm(data_loader, desc="test"):
+        # for inputs, targets in tqdm(data_loader, desc="test"):
+        for inputs, targets in data_loader:
             outputs = model(inputs.to(device))
             
             targets = torch.squeeze(targets, 1).long().to(device)
@@ -132,8 +129,7 @@ def test(model, evaluator, data_loader, task, criterion, device, run, save_folde
 
         return [test_loss, auc, acc]
 
-
-def train_2d_model(model, DEVICE, data_flag, milestones, gamma, output_root, task, train_loader, train_loader_at_eval, val_loader, test_loader, NUM_EPOCHS, lr, tb_twod):
+def train_2d_model(model, DEVICE, data_flag, milestones, gamma, output_root, task, train_loader, train_loader_at_eval, val_loader, test_loader, NUM_EPOCHS, lr, hyperparameters):
     
     model = model.to(DEVICE)
 
@@ -152,13 +148,14 @@ def train_2d_model(model, DEVICE, data_flag, milestones, gamma, output_root, tas
     test_logs = ['test_'+log for log in logs]
     log_dict = OrderedDict.fromkeys(train_logs+val_logs+test_logs, 0)
 
-    writer = SummaryWriter(log_dir=os.path.join(output_root, 'Tensorboard_Results2D')) if tb_twod else SummaryWriter(log_dir=os.path.join(output_root, 'Tensorboard_Results3D'))
+    writer = SummaryWriter(log_dir=os.path.join(output_root, f'{model.name}_{hyperparameters}'))
 
     best_auc = 0
     best_epoch = 0
     best_model = deepcopy(model)
 
-    for epoch in range(NUM_EPOCHS):        
+    for epoch in range(NUM_EPOCHS): 
+        print(f"Epoch {epoch} of {NUM_EPOCHS - 1}")
         train_loss = train(model, train_loader, task, criterion, optimizer, DEVICE, writer)
         
         train_metrics = test(model, train_evaluator, train_loader_at_eval, task, criterion, DEVICE, model.name)
@@ -185,11 +182,9 @@ def train_2d_model(model, DEVICE, data_flag, milestones, gamma, output_root, tas
             print('cur_best_auc:', best_auc)
             print('cur_best_epoch', best_epoch)
 
-    state = {
-        'net': best_model.state_dict(),
-    }
-
-    path = os.path.join(output_root, f'{model.name}_best_model.pth')
+    state = best_model.state_dict()
+    print(state)
+    path = os.path.join(output_root, f'{model.name}_best_model_{hyperparameters}.pth')
     torch.save(state, path)
 
     train_metrics = test(best_model, train_evaluator, train_loader_at_eval, task, criterion, DEVICE, model.name, output_root)
@@ -208,9 +203,21 @@ def train_2d_model(model, DEVICE, data_flag, milestones, gamma, output_root, tas
 
     writer.close()
 
+def train_3d_model(model, DEVICE, data_flag, milestones, gamma, output_root, task, train_loader, train_loader_at_eval, val_loader, test_loader, NUM_EPOCHS, lr, hyperparameters):
+    conv = 'Conv3d'
+    pretrained_3d = 'i3d'
+    model_flag = 'resnet18'
 
-def train_3d_model(model, DEVICE, data_flag, milestones, gamma, output_root, task, train_loader, train_loader_at_eval, val_loader, test_loader, NUM_EPOCHS, lr, tb_twod):
-    
+    if conv=='ACSConv':
+        model = model_to_syncbn(ACSConverter(model))
+    if conv=='Conv2_5d':
+        model = model_to_syncbn(Conv2_5dConverter(model))
+    if conv=='Conv3d':
+        if pretrained_3d == 'i3d':
+            model = model_to_syncbn(Conv3dConverter(model, i3d_repeat_axis=-3))
+        else:
+            model = model_to_syncbn(Conv3dConverter(model, i3d_repeat_axis=None))
+
     model = model.to(DEVICE)
 
     criterion = nn.CrossEntropyLoss()
@@ -221,20 +228,20 @@ def train_3d_model(model, DEVICE, data_flag, milestones, gamma, output_root, tas
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=gamma)
-
     logs = ['loss', 'auc', 'acc']
     train_logs = ['train_'+log for log in logs]
     val_logs = ['val_'+log for log in logs]
     test_logs = ['test_'+log for log in logs]
     log_dict = OrderedDict.fromkeys(train_logs+val_logs+test_logs, 0)
 
-    writer = SummaryWriter(log_dir=os.path.join(output_root, 'Tensorboard_Results2D')) if tb_twod else SummaryWriter(log_dir=os.path.join(output_root, 'Tensorboard_Results3D'))
+    writer = SummaryWriter(log_dir=os.path.join(output_root, f'{model.name}_{hyperparameters}'))
 
     best_auc = 0
     best_epoch = 0
     best_model = deepcopy(model)
 
-    for epoch in range(NUM_EPOCHS):        
+    for epoch in range(NUM_EPOCHS):  
+        print(f"Epoch {epoch} of {NUM_EPOCHS - 1}")      
         train_loss = train(model, train_loader, task, criterion, optimizer, DEVICE, writer)
         
         train_metrics = test(model, train_evaluator, train_loader_at_eval, task, criterion, DEVICE, model.name)
@@ -261,11 +268,9 @@ def train_3d_model(model, DEVICE, data_flag, milestones, gamma, output_root, tas
             print('cur_best_auc:', best_auc)
             print('cur_best_epoch', best_epoch)
 
-    state = {
-        'net': best_model.state_dict(),
-    }
+    state = best_model.state_dict()
 
-    path = os.path.join(output_root, f'{model.name}_best_model.pth')
+    path = os.path.join(output_root, f'{model.name}_best_model_{hyperparameters}.pth')
     torch.save(state, path)
 
     train_metrics = test(best_model, train_evaluator, train_loader_at_eval, task, criterion, DEVICE, model.name, output_root)
@@ -283,3 +288,31 @@ def train_3d_model(model, DEVICE, data_flag, milestones, gamma, output_root, tas
         f.write(log)  
 
     writer.close()
+
+def plot_confusion_matrix(model, model_type, test_loader, hyperparameters, output_root):
+    model.load_state_dict(torch.load(f'{output_root}/{model_type}_best_model_{hyperparameters}.pth'))
+    model.eval()
+
+    all_true_labels = []
+    all_pred_labels = []
+
+    with torch.no_grad():
+        for inputs, targets in test_loader:
+            outputs = model(inputs)
+            
+            _, predicted = torch.max(outputs, 1)
+
+            all_true_labels.extend(torch.squeeze(targets, 1).long())
+            all_pred_labels.extend(predicted.cpu().numpy())
+
+    y_true = np.array(all_true_labels)
+    y_pred = np.array(all_pred_labels)
+
+    cm = confusion_matrix(y_true, y_pred)
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.savefig(f'{output_root}/{model_type}_best_model_{hyperparameters}.png')
+    # plt.show()

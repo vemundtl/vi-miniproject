@@ -9,3 +9,5 @@ saved_images
 u-resnet34.pt
 output2d
 output3d
+kill_tensorboard.py
+.DS_Store
